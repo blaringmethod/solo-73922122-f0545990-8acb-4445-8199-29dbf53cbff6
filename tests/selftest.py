@@ -1,10 +1,12 @@
-"""自测:核心场景、证据不足分支、增量计数一致性、5 万条变更性能、HTTP 接口。
+"""自测:核心场景、证据不足分支、增量计数一致性、5 万条变更性能、
+续查接力/整批退回/并发互斥、HTTP 接口。
 
 运行:python3 -m tests.selftest   (在仓库根目录)
 """
 import json
 import random
 import sys
+import threading
 import time
 
 from app.core import (
@@ -12,10 +14,13 @@ from app.core import (
     InputError,
     load_receipt_csv,
     load_waybill_csv,
+    parse_continuation,
     parse_evidence,
     verify,
+    verify_initial,
 )
-from app.sample import build_sample
+from app.rounds import Round, apply_continuation
+from app.sample import build_continuations, build_sample
 
 FAILED = []
 
@@ -41,6 +46,15 @@ def expect_evidence_error(name, fn, needle):
 def run_verify(evidence_dict, wb_csv, rc_csv):
     ev = parse_evidence(json.loads(json.dumps(evidence_dict)))
     return verify(ev, load_waybill_csv(wb_csv.encode()), load_receipt_csv(rc_csv.encode()))
+
+
+def make_round():
+    """用样例初查建立一个轮次(终点 110)。"""
+    evidence, wb_csv, rc_csv, _ = build_sample()
+    ev = parse_evidence(json.loads(json.dumps(evidence)))
+    eng, result = verify_initial(ev, load_waybill_csv(wb_csv.encode()),
+                                 load_receipt_csv(rc_csv.encode()))
+    return Round(eng, ev.start_commit, result["snapshot_rows"], result)
 
 
 def t_sample():
@@ -176,6 +190,148 @@ def t_csv_validation():
     check("BOM 头可解析", load_waybill_csv("单号,状态,件数\nW1,已签收,3\n".encode("utf-8-sig")) == d3)
 
 
+def t_continuation_parse():
+    print("== 续查包格式校验")
+    cont1, _, _ = build_continuations()
+    d = json.loads(json.dumps(cont1))
+    d["snapshots"] = {"waybills": [], "receipts": []}
+    try:
+        parse_continuation(d)
+        check("续查包携带 snapshots 拒绝", False)
+    except InputError as e:
+        check("续查包携带 snapshots 拒绝", "snapshots" in str(e), str(e))
+    d = json.loads(json.dumps(cont1))
+    d["end_commit"] = d["start_commit"]
+    try:
+        parse_continuation(d)
+        check("终止号不大于起始号拒绝", False)
+    except InputError as e:
+        check("终止号不大于起始号拒绝", "更晚" in str(e), str(e))
+    d = json.loads(json.dumps(cont1))
+    del d["transactions"]
+    try:
+        parse_continuation(d)
+        check("缺 transactions 拒绝", False)
+    except InputError as e:
+        check("缺 transactions 拒绝", "transactions" in str(e), str(e))
+    c = parse_continuation(json.loads(json.dumps(cont1)))
+    check("正常解析续查包",
+          c.start_commit == 110 and c.end_commit == 116 and len(c.transactions) == 6
+          and c.total_changes == 8,
+          f"{c.start_commit}->{c.end_commit} {len(c.transactions)}tx {c.total_changes}ch")
+
+
+def t_continuation_flow():
+    print("== 续查:两批接力 + 跨批区间合并")
+    cont1, cont2, expected = build_continuations()
+    rnd = make_round()
+    v0 = rnd.view()
+    check("初始终点=110,批数=0", v0["end_commit"] == 110 and v0["batches"] == 0)
+
+    st, msg, view = apply_continuation(rnd, json.loads(json.dumps(cont1)))
+    check("续查包1通过", st == "ok", f"{st}: {msg}")
+    check("包1后终点=116,批数=1", view["end_commit"] == 116 and view["batches"] == 1)
+    check("包1运单区间", view["waybill_csv"]["intervals"] == expected["batch1"]["waybill_intervals"],
+          str(view["waybill_csv"]["intervals"]))
+    check("包1签收区间", view["receipt_csv"]["intervals"] == expected["batch1"]["receipt_intervals"],
+          str(view["receipt_csv"]["intervals"]))
+    check("包1交集", view["intersection"] == expected["batch1"]["intersection"],
+          str(view["intersection"]))
+    check("跨批相邻区间合并(110-111)", [110, 111] in view["waybill_csv"]["intervals"])
+    check("包1累计变更=20", view["changes_applied"] == 20, str(view["changes_applied"]))
+
+    st, msg, view = apply_continuation(rnd, json.loads(json.dumps(cont2)))
+    check("续查包2通过", st == "ok", f"{st}: {msg}")
+    check("包2后终点=118,批数=2", view["end_commit"] == 118 and view["batches"] == 2)
+    check("包2运单区间", view["waybill_csv"]["intervals"] == expected["batch2"]["waybill_intervals"],
+          str(view["waybill_csv"]["intervals"]))
+    check("包2签收区间", view["receipt_csv"]["intervals"] == expected["batch2"]["receipt_intervals"],
+          str(view["receipt_csv"]["intervals"]))
+    check("包2交集", view["intersection"] == expected["batch2"]["intersection"],
+          str(view["intersection"]))
+    check("跨批相邻区间合并(116-118)", [116, 118] in view["waybill_csv"]["intervals"]
+          and [116, 118] in view["receipt_csv"]["intervals"])
+    check("包2累计变更=22", view["changes_applied"] == 22, str(view["changes_applied"]))
+
+
+def t_continuation_reject():
+    print("== 续查整批退回:保留原终点/状态/结果,改正后可重传")
+    cont1, _, expected = build_continuations()
+    base_intervals = [[100, 100], [102, 102], [105, 106], [108, 108], [110, 110]]
+    base_intervals_rc = [[100, 100], [102, 103], [106, 106], [108, 108], [110, 110]]
+    rnd = make_round()
+
+    gap = json.loads(json.dumps(cont1))
+    gap["transactions"] = [t for t in gap["transactions"] if t["commit"] != 113]
+    st, msg, view = apply_continuation(rnd, gap)
+    check("缺号 -> 整批退回", st == "insufficient_evidence" and "缺号" in msg, f"{st}: {msg}")
+    v = rnd.view()
+    check("退回后终点保持 110", v["end_commit"] == 110)
+    check("退回后批数保持 0", v["batches"] == 0)
+    check("退回后运单区间不变", v["waybill_csv"]["intervals"] == base_intervals)
+    check("退回后签收区间不变", v["receipt_csv"]["intervals"] == base_intervals_rc)
+
+    bad = json.loads(json.dumps(cont1))
+    bad["transactions"][0]["changes"][0]["before"]["实收件数"] = 99
+    st, msg, view = apply_continuation(rnd, bad)
+    check("前值不符 -> 整批退回", st == "insufficient_evidence" and "前值" in msg, f"{st}: {msg}")
+    check("退回后终点仍保持 110", rnd.view()["end_commit"] == 110)
+
+    st, msg, view = apply_continuation(rnd, json.loads(json.dumps(cont1)))
+    check("改正后从原终点重传通过", st == "ok" and view["end_commit"] == 116, f"{st}: {msg}")
+    check("重传后区间正确", view["waybill_csv"]["intervals"] == expected["batch1"]["waybill_intervals"])
+
+    st, msg, view = apply_continuation(rnd, json.loads(json.dumps(cont1)))
+    check("旧起点续包 -> 终点已变", st == "stale_endpoint" and "终点已变" in msg, f"{st}: {msg}")
+    check("终点已变时返回当前视图", view is not None and view["end_commit"] == 116)
+
+
+def t_engine_clone_isolation():
+    print("== 引擎克隆隔离:续查失败不污染原状态")
+    from app.core import parse_continuation as pc, replay_continuation
+    cont1, _, _ = build_continuations()
+    rnd = make_round()
+    eng = rnd.state.engine
+    before = (sorted(eng.waybills), sorted(eng.receipts), eng.mism_a, eng.mism_b)
+    bad = json.loads(json.dumps(cont1))
+    bad["transactions"][2]["changes"][0]["before"]["实收件数"] = 99  # 提交 113 前值错
+    eng2 = eng.clone()
+    try:
+        replay_continuation(eng2, pc(bad))
+        check("克隆上重放抛 EvidenceError", False)
+    except EvidenceError:
+        check("克隆上重放抛 EvidenceError", True)
+    after = (sorted(eng.waybills), sorted(eng.receipts), eng.mism_a, eng.mism_b)
+    check("原引擎状态未被污染", before == after)
+    ok = eng.clone()
+    pts_a, pts_b = replay_continuation(ok, pc(json.loads(json.dumps(cont1))))
+    check("克隆上完整重放成功", pts_a == [111, 114, 116] and pts_b == [113, 114, 116],
+          f"a={pts_a} b={pts_b}")
+
+
+def t_continuation_concurrent():
+    print("== 并发续查:同一终点只生效一份")
+    cont1, _, _ = build_continuations()
+    rnd = make_round()
+    barrier = threading.Barrier(2)
+    results = []
+
+    def worker():
+        barrier.wait()
+        results.append(apply_continuation(rnd, json.loads(json.dumps(cont1)))[0])
+
+    ts = [threading.Thread(target=worker) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    check("一份生效、另一份提示终点已变",
+          sorted(results) == ["ok", "stale_endpoint"], str(results))
+    v = rnd.view()
+    check("终点只推进一次", v["end_commit"] == 116 and v["batches"] == 1,
+          f"end={v['end_commit']} batches={v['batches']}")
+
+
 def t_perf_50k():
     print("== 5 万条变更性能与一致性")
     rng = random.Random(42)
@@ -278,6 +434,71 @@ def t_http():
     check("样例证据包可下载", resp5.status_code == 200
           and resp5.json()["start_commit"] == 100)
 
+    # ---- 续查 HTTP 流程 ----
+    print("== HTTP 续查流程")
+    rid = body["round_id"]
+    check("初查返回本轮链接", body.get("round_url") == f"/round/{rid}", str(body.get("round_url")))
+    resp = client.get(body["round_url"])
+    check("轮次页可打开", resp.status_code == 200 and "续查" in resp.text, str(resp.status_code))
+    resp = client.get(f"/api/round/{rid}")
+    check("轮次状态接口", resp.status_code == 200
+          and resp.json()["result"]["end_commit"] == 110)
+
+    cont1, cont2, cexpected = build_continuations()
+
+    def post_cont(rid_, obj):
+        return client.post(f"/api/round/{rid_}/continue", files={
+            "evidence": ("cont.json", json.dumps(obj, ensure_ascii=False).encode(),
+                         "application/json")})
+
+    resp = post_cont(rid, cont1)
+    b = resp.json()
+    check("续查包1 HTTP 200 ok", resp.status_code == 200 and b["status"] == "ok",
+          f"{resp.status_code} {b.get('status')}")
+    check("续查包1区间合并", b["result"]["waybill_csv"]["intervals"]
+          == cexpected["batch1"]["waybill_intervals"], str(b["result"]["waybill_csv"]["intervals"]))
+    check("续查包1交集", b["result"]["intersection"] == cexpected["batch1"]["intersection"])
+
+    resp = post_cont(rid, cont2)
+    b = resp.json()
+    check("续查包2 HTTP 200 ok", resp.status_code == 200 and b["status"] == "ok",
+          f"{resp.status_code} {b.get('status')}")
+    check("跨批合并 116-118", [116, 118] in b["result"]["waybill_csv"]["intervals"],
+          str(b["result"]["waybill_csv"]["intervals"]))
+    check("续查包2交集", b["result"]["intersection"] == cexpected["batch2"]["intersection"])
+
+    resp = post_cont(rid, cont1)  # 旧起点 110,当前终点已变为 118
+    check("旧起点续包 -> 409 终点已变",
+          resp.status_code == 409 and resp.json()["status"] == "stale_endpoint",
+          f"{resp.status_code} {resp.json().get('status')}")
+    check("终点已变响应带当前视图", resp.json()["result"]["end_commit"] == 118)
+
+    gap = {"start_commit": 118, "end_commit": 119, "transactions": []}
+    resp = post_cont(rid, gap)
+    check("缺号 -> 整批退回", resp.status_code == 200
+          and resp.json()["status"] == "insufficient_evidence",
+          f"{resp.status_code} {resp.json().get('status')}")
+    resp = client.get(f"/api/round/{rid}")
+    check("退回后终点保持 118", resp.json()["result"]["end_commit"] == 118)
+    check("退回后批数保持 2", resp.json()["result"]["batches"] == 2)
+
+    bad_json = post_cont(rid, {"start_commit": 118, "end_commit": 120,
+                               "transactions": "not-a-list"})
+    check("坏续查包 -> 400 invalid_input",
+          bad_json.status_code == 400 and bad_json.json()["status"] == "invalid_input",
+          f"{bad_json.status_code}")
+
+    resp = client.get("/round/deadbeef")
+    check("未知轮次页 404", resp.status_code == 404, str(resp.status_code))
+    resp = post_cont("deadbeef", cont1)
+    check("未知轮次续查 404", resp.status_code == 404
+          and resp.json()["status"] == "not_found", str(resp.status_code))
+
+    resp = client.get("/api/sample/continuation1.json")
+    check("样例续查包1可下载", resp.status_code == 200 and resp.json()["start_commit"] == 110)
+    resp = client.get("/api/sample/continuation2.json")
+    check("样例续查包2可下载", resp.status_code == 200 and resp.json()["start_commit"] == 116)
+
 
 def main():
     t_sample()
@@ -286,6 +507,11 @@ def main():
     t_evidence_errors()
     t_receipt_retarget()
     t_csv_validation()
+    t_continuation_parse()
+    t_continuation_flow()
+    t_continuation_reject()
+    t_engine_clone_isolation()
+    t_continuation_concurrent()
     t_perf_50k()
     t_http()
     print()

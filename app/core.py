@@ -10,6 +10,8 @@
   运单签收状态翻转时,只触碰该单号名下的签收行(通过 单号 -> 签收号 索引)。
 - 日志缺号(提交号不连续/缺失/超出终止号)或变更前值与当前状态对不上时,
   抛出 EvidenceError,由上层提示"证据不足"并停止核查。
+- 续查:初查通过后保留终点引擎状态;续查包只带新事务(不复制两张全表),
+  在状态克隆上重放,整包通过后才替换原状态,吻合区间跨批相邻自动合并。
 """
 from __future__ import annotations
 
@@ -92,19 +94,43 @@ class Evidence:
     total_changes: int
 
 
+def _int_field(obj, name):
+    v = obj.get(name)
+    if isinstance(v, bool) or not isinstance(v, int):
+        # 容忍字符串形式的数字
+        if isinstance(v, str) and v.strip().lstrip("-").isdigit():
+            return int(v.strip())
+        raise InputError(f"字段 {name} 必须是整数,实际为 {v!r}")
+    return v
+
+
+def _parse_transactions(txs_raw, what: str):
+    """解析逐事务数组(初查证据包与续查包共用同一格式)。"""
+    if not isinstance(txs_raw, list):
+        raise InputError(f"{what}缺少 transactions 数组")
+    transactions = []
+    total = 0
+    for i, tx in enumerate(txs_raw):
+        if not isinstance(tx, dict):
+            raise InputError(f"transactions[{i}] 必须是对象")
+        commit = _int_field(tx, "commit")
+        changes_raw = tx.get("changes")
+        if not isinstance(changes_raw, list):
+            raise InputError(f"transactions[{i}].changes 必须是数组")
+        changes = []
+        for j, ch in enumerate(changes_raw):
+            changes.append(_parse_change(ch, f"transactions[{i}].changes[{j}]"))
+        total += len(changes)
+        if total > MAX_CHANGES:
+            raise InputError(f"变更总数超过上限 {MAX_CHANGES} 条")
+        transactions.append(Transaction(commit=commit, changes=changes))
+    return transactions, total
+
+
 def parse_evidence(data) -> Evidence:
     """校验并解析证据包 JSON(已 json.loads 的对象)。"""
     if not isinstance(data, dict):
         raise InputError("证据包顶层必须是 JSON 对象")
-
-    def _int_field(obj, name):
-        v = obj.get(name)
-        if isinstance(v, bool) or not isinstance(v, int):
-            # 容忍字符串形式的数字
-            if isinstance(v, str) and v.strip().lstrip("-").isdigit():
-                return int(v.strip())
-            raise InputError(f"证据包字段 {name} 必须是整数,实际为 {v!r}")
-        return v
 
     start = _int_field(data, "start_commit")
     end = _int_field(data, "end_commit")
@@ -126,29 +152,34 @@ def parse_evidence(data) -> Evidence:
 
     wb_rows = _snap("waybills", "运单表", "运单")
     rc_rows = _snap("receipts", "签收表", "签收")
-
-    txs_raw = data.get("transactions")
-    if not isinstance(txs_raw, list):
-        raise InputError("证据包缺少 transactions 数组")
-
-    transactions = []
-    total = 0
-    for i, tx in enumerate(txs_raw):
-        if not isinstance(tx, dict):
-            raise InputError(f"transactions[{i}] 必须是对象")
-        commit = _int_field(tx, "commit")
-        changes_raw = tx.get("changes")
-        if not isinstance(changes_raw, list):
-            raise InputError(f"transactions[{i}].changes 必须是数组")
-        changes = []
-        for j, ch in enumerate(changes_raw):
-            changes.append(_parse_change(ch, f"transactions[{i}].changes[{j}]"))
-        total += len(changes)
-        if total > MAX_CHANGES:
-            raise InputError(f"变更总数超过上限 {MAX_CHANGES} 条")
-        transactions.append(Transaction(commit=commit, changes=changes))
+    transactions, total = _parse_transactions(data.get("transactions"), "证据包")
 
     return Evidence(start, end, wb_rows, rc_rows, transactions, total)
+
+
+@dataclass
+class Continuation:
+    start_commit: int
+    end_commit: int
+    transactions: list  # list[Transaction]
+    total_changes: int
+
+
+def parse_continuation(data) -> Continuation:
+    """校验并解析续查包 JSON:只有起止提交号 + 新事务,不复制两张全表。"""
+    if not isinstance(data, dict):
+        raise InputError("续查包顶层必须是 JSON 对象")
+
+    start = _int_field(data, "start_commit")
+    end = _int_field(data, "end_commit")
+    if start >= end:
+        raise InputError(
+            f"续查包终止提交号 {end} 必须大于起始提交号 {start}(续包须接到更晚的提交)")
+    if data.get("snapshots") is not None:
+        raise InputError("续查包不应携带 snapshots:续查只重放新事务,不复制两张全表")
+
+    transactions, total = _parse_transactions(data.get("transactions"), "续查包")
+    return Continuation(start, end, transactions, total)
 
 
 def _parse_change(ch, where: str) -> Change:
@@ -260,6 +291,20 @@ class Engine:
         return (self._full_mism(self.current_view_a(), self.tgt_a),
                 self._full_mism(self.current_view_b(), self.tgt_b))
 
+    def clone(self) -> "Engine":
+        """结构拷贝当前重放状态(供续查在副本上试跑,整包通过后才替换原状态)。
+
+        行 dict 在重放中从不被原地修改(变更只会整行替换),因此行对象可共享,
+        只需拷贝容器:两表字典、已签收集合、单号->签收号索引。
+        """
+        c = Engine(self.tgt_a, self.tgt_b)
+        c.waybills = dict(self.waybills)
+        c.receipts = dict(self.receipts)
+        c.signed = set(self.signed)
+        c.receipts_by_waybill = {k: set(v) for k, v in self.receipts_by_waybill.items()}
+        c.mism_a, c.mism_b = self.mism_a, self.mism_b
+        return c
+
     # ---- 变更应用 ----
 
     def apply_change(self, ch: Change, where: str):
@@ -342,6 +387,24 @@ def to_intervals(points) -> list:
     return ivs
 
 
+def merge_points_into_intervals(existing: list, new_points) -> list:
+    """把一批新的吻合提交号并入既有区间列表,返回新列表(不改入参)。
+
+    新点全部晚于既有区间的最大提交号;若新首点与既有末区间相邻(差 1),
+    跨批区间也会合并,例如既有 [...[110,110]] 遇上新点 111 -> [...[110,111]]。
+    """
+    ivs = to_intervals(new_points)
+    merged = [list(iv) for iv in existing]
+    if not ivs:
+        return merged
+    if merged and merged[-1][1] + 1 >= ivs[0][0]:
+        merged[-1][1] = max(merged[-1][1], ivs[0][1])
+        merged.extend(ivs[1:])
+    else:
+        merged.extend(ivs)
+    return merged
+
+
 def intersect_intervals(a: list, b: list) -> list:
     i = j = 0
     out = []
@@ -357,25 +420,21 @@ def intersect_intervals(a: list, b: list) -> list:
     return out
 
 
-def verify(ev: Evidence, tgt_a: dict, tgt_b: dict) -> dict:
-    """主流程:装载快照 -> 在起点比对 -> 逐事务重放并在每个提交点比对。"""
-    eng = Engine(tgt_a, tgt_b)
-    eng.load_snapshot(ev.wb_rows, ev.rc_rows)
+def _replay_transactions(eng: Engine, start_commit: int, end_commit: int,
+                         transactions, match_a: list, match_b: list):
+    """逐事务重放 start_commit+1 .. end_commit,在每个提交点记录吻合情况。
 
-    match_a, match_b = [], []
-    if eng.mism_a == 0:
-        match_a.append(ev.start_commit)
-    if eng.mism_b == 0:
-        match_b.append(ev.start_commit)
-
-    expected = ev.start_commit + 1
-    for tx in ev.transactions:
+    日志缺号/乱序/超出终止号或前值对不上时抛 EvidenceError;此时 eng 可能
+    已部分推进,调用方若需保留原状态应先 clone(见 verify_initial / 续查流程)。
+    """
+    expected = start_commit + 1
+    for tx in transactions:
         if tx.commit != expected:
             raise EvidenceError(
                 f"日志缺号或乱序: 期望提交号 {expected}, 实际 {tx.commit}")
-        if tx.commit > ev.end_commit:
+        if tx.commit > end_commit:
             raise EvidenceError(
-                f"日志缺号: 提交号 {tx.commit} 超出终止提交号 {ev.end_commit}")
+                f"日志缺号: 提交号 {tx.commit} 超出终止提交号 {end_commit}")
         for idx, ch in enumerate(tx.changes):
             eng.apply_change(ch, f"提交 {tx.commit} 第 {idx + 1} 条变更")
         if eng.mism_a == 0:
@@ -384,13 +443,30 @@ def verify(ev: Evidence, tgt_a: dict, tgt_b: dict) -> dict:
             match_b.append(tx.commit)
         expected += 1
 
-    if expected != ev.end_commit + 1:
+    if expected != end_commit + 1:
         raise EvidenceError(
-            f"日志缺号: 缺少提交 {expected}..{ev.end_commit} 的记录")
+            f"日志缺号: 缺少提交 {expected}..{end_commit} 的记录")
+
+
+def verify_initial(ev: Evidence, tgt_a: dict, tgt_b: dict):
+    """初查主流程:装载快照 -> 在起点比对 -> 逐事务重放并在每个提交点比对。
+
+    返回 (重放到终点的引擎, 结果字典);引擎可交给续查继续接力。
+    """
+    eng = Engine(tgt_a, tgt_b)
+    eng.load_snapshot(ev.wb_rows, ev.rc_rows)
+
+    match_a, match_b = [], []
+    if eng.mism_a == 0:
+        match_a.append(ev.start_commit)
+    if eng.mism_b == 0:
+        match_b.append(ev.start_commit)
+    _replay_transactions(eng, ev.start_commit, ev.end_commit, ev.transactions,
+                         match_a, match_b)
 
     iv_a = to_intervals(match_a)
     iv_b = to_intervals(match_b)
-    return {
+    result = {
         "start_commit": ev.start_commit,
         "end_commit": ev.end_commit,
         "compare_points": ev.end_commit - ev.start_commit + 1,
@@ -400,6 +476,24 @@ def verify(ev: Evidence, tgt_a: dict, tgt_b: dict) -> dict:
         "receipt_csv": {"intervals": iv_b, "match_commits": len(match_b)},
         "intersection": intersect_intervals(iv_a, iv_b),
     }
+    return eng, result
+
+
+def verify(ev: Evidence, tgt_a: dict, tgt_b: dict) -> dict:
+    """初查(仅取结果字典,不保留引擎状态)。"""
+    return verify_initial(ev, tgt_a, tgt_b)[1]
+
+
+def replay_continuation(eng: Engine, cont: Continuation):
+    """在 eng(通常是当前状态的克隆)上只重放续包的新事务。
+
+    返回 (运单侧新吻合提交号列表, 签收侧新吻合提交号列表)。
+    续包起点本身的吻合情况与上一批终点相同,无需重复比对。
+    """
+    match_a, match_b = [], []
+    _replay_transactions(eng, cont.start_commit, cont.end_commit, cont.transactions,
+                         match_a, match_b)
+    return match_a, match_b
 
 
 # ---- CSV 读取 ----

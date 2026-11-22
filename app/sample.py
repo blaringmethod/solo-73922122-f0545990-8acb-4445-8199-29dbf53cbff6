@@ -35,6 +35,9 @@ RC_ROWS_0 = [
 WB0009 = {"单号": "WB0009", "状态": "已签收", "件数": 1, "目的地": "杭州"}
 RC0009 = {"签收号": "RC0009", "单号": "WB0009", "实收件数": 1, "签收人": "赵六"}
 
+WB0010 = {"单号": "WB0010", "状态": "已签收", "件数": 1, "目的地": "深圳"}
+RC0010 = {"签收号": "RC0010", "单号": "WB0010", "实收件数": 1, "签收人": "钱七"}
+
 
 def _upd(table, key, before, **changes):
     after = dict(before)
@@ -78,3 +81,76 @@ def build_sample():
         "intersection": [[100, 100], [102, 102], [106, 106], [108, 108], [110, 110]],
     }
     return evidence, waybill_csv, receipt_csv, expected
+
+
+def build_continuations():
+    """构造两个续查包样例(接在初查样例 100..110 之后),供网页演示续查。
+
+    返回 (cont1, cont2, expected)。初查终点 110 的两表状态与起点 100 相同。
+
+    续查包 1(110 -> 116),各提交后吻合情况:
+      提交  运单导出  签收导出  说明
+      111   ✓        ✗        RC0001 实收件数 3->4(运单侧不受影响,与 110 跨批合并)
+      112   ✗        ✗        WB0001 件数 3->4
+      113   ✗        ✓        RC0001 实收件数改回 3
+      114   ✓        ✓        WB0001 件数改回 3
+      115   ✗        ✗        新增 WB0010/RC0010
+      116   ✓        ✓        删除 RC0010/WB0010
+
+    续查包 2(116 -> 118):WB0002(运输中,不在导出视图)件数 5->6->5,
+    两个提交后两视图均保持吻合,区间 [116,116] 与 [117,118] 跨批合并为 [116,118]。
+    """
+    wb1, wb2, _ = WB_ROWS_0
+    rc1 = RC_ROWS_0[0]
+    cont1 = {
+        "start_commit": 110,
+        "end_commit": 116,
+        "transactions": [
+            {"commit": 111, "changes": [_upd("receipts", "RC0001", rc1, 实收件数=4)]},
+            {"commit": 112, "changes": [_upd("waybills", "WB0001", wb1, 件数=4)]},
+            {"commit": 113, "changes": [
+                _upd("receipts", "RC0001", dict(rc1, 实收件数=4), 实收件数=3)]},
+            {"commit": 114, "changes": [
+                _upd("waybills", "WB0001", dict(wb1, 件数=4), 件数=3)]},
+            {"commit": 115, "changes": [
+                {"table": "waybills", "op": "insert", "key": "WB0010",
+                 "before": None, "after": WB0010},
+                {"table": "receipts", "op": "insert", "key": "RC0010",
+                 "before": None, "after": RC0010},
+            ]},
+            {"commit": 116, "changes": [
+                {"table": "receipts", "op": "delete", "key": "RC0010",
+                 "before": RC0010, "after": None},
+                {"table": "waybills", "op": "delete", "key": "WB0010",
+                 "before": WB0010, "after": None},
+            ]},
+        ],
+    }
+    cont2 = {
+        "start_commit": 116,
+        "end_commit": 118,
+        "transactions": [
+            {"commit": 117, "changes": [_upd("waybills", "WB0002", wb2, 件数=6)]},
+            {"commit": 118, "changes": [
+                _upd("waybills", "WB0002", dict(wb2, 件数=6), 件数=5)]},
+        ],
+    }
+    expected = {
+        "batch1": {
+            "waybill_intervals": [[100, 100], [102, 102], [105, 106], [108, 108],
+                                  [110, 111], [114, 114], [116, 116]],
+            "receipt_intervals": [[100, 100], [102, 103], [106, 106], [108, 108],
+                                  [110, 110], [113, 114], [116, 116]],
+            "intersection": [[100, 100], [102, 102], [106, 106], [108, 108],
+                             [110, 110], [114, 114], [116, 116]],
+        },
+        "batch2": {
+            "waybill_intervals": [[100, 100], [102, 102], [105, 106], [108, 108],
+                                  [110, 111], [114, 114], [116, 118]],
+            "receipt_intervals": [[100, 100], [102, 103], [106, 106], [108, 108],
+                                  [110, 110], [113, 114], [116, 118]],
+            "intersection": [[100, 100], [102, 102], [106, 106], [108, 108],
+                             [110, 110], [114, 114], [116, 118]],
+        },
+    }
+    return cont1, cont2, expected
